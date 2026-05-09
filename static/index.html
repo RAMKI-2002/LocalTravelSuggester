@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Trip Suggester</title>
+
+    <!--
+      Leaflet:
+        Free, no-API-key map library. We use the OpenStreetMap tile server
+        which matches our Overpass + Nominatim sourcing nicely.
+    -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">[T]</span>
+        <div>
+          <h1>Local Trip Suggester</h1>
+          <p class="tagline">
+            Weather-aware AI recommendations - Foursquare + OpenStreetMap +
+            AWS Bedrock
+          </p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="health-toggle" class="health-pill health-pill--unknown" type="button">
+          <span class="dot"></span>
+          <span class="label">checking...</span>
+        </button>
+        <a class="docs-link" href="/how-it-works" target="_blank" rel="noreferrer"
+          >How it works</a
+        >
+        <a class="docs-link" href="/docs" target="_blank" rel="noreferrer"
+          >API docs</a
+        >
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- ======================================================== -->
+      <!--  LEFT COLUMN: form + suggestions list                   -->
+      <!-- ======================================================== -->
+      <section class="left-col">
+        <form id="trip-form" class="card form-card">
+          <h2>Plan your day</h2>
+
+          <label>
+            City <span class="req">*</span>
+            <input
+              type="text"
+              name="city"
+              required
+              placeholder="Hyderabad"
+              autocomplete="off"
+            />
+          </label>
+
+          <label>
+            Preference (optional)
+            <input
+              type="text"
+              name="preference"
+              placeholder="peaceful places with good views"
+              autocomplete="off"
+            />
+            <small>e.g. peaceful, adventure, history, family, food, spiritual, shopping</small>
+          </label>
+
+          <label>
+            Your area (optional)
+            <input
+              type="text"
+              name="locality"
+              placeholder="Gachibowli"
+              autocomplete="off"
+            />
+            <small>used to compute distance + travel cost on the map</small>
+          </label>
+
+          <label>
+            Number of suggestions
+            <input
+              type="number"
+              name="max_results"
+              min="1"
+              max="10"
+              value="5"
+            />
+          </label>
+
+          <button id="submit-btn" type="submit" class="primary">
+            <span class="btn-label">Suggest places</span>
+            <span class="btn-spinner" hidden></span>
+          </button>
+
+          <p id="form-error" class="error-msg" hidden></p>
+        </form>
+
+        <!-- Anchor we scroll to when results arrive. -->
+        <div id="results-anchor"></div>
+
+        <section id="weather-card" class="card weather-card" hidden>
+          <h3>Current weather <span id="weather-city"></span></h3>
+          <div class="weather-grid">
+            <div>
+              <span class="big" id="w-temp">--</span><span>&deg;C</span>
+              <small id="w-feels"></small>
+            </div>
+            <div>
+              <strong id="w-cond">--</strong>
+              <small id="w-desc"></small>
+            </div>
+            <div>
+              <small>Humidity</small><span id="w-hum">--</span>
+            </div>
+            <div>
+              <small>Wind</small><span id="w-wind">--</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="meta-card" class="card meta-card" hidden>
+          <div><strong>Took</strong> <span id="m-elapsed">--</span> ms</div>
+          <div><strong>LLM</strong> <span id="m-llm">--</span></div>
+          <div>
+            <strong>Understood as</strong>
+            <span id="m-intent" class="tag-list"></span>
+          </div>
+          <div>
+            <strong>AI curate</strong>
+            <span id="m-curate" class="tag-list"></span>
+          </div>
+          <div>
+            <strong>Cache hits</strong>
+            <span id="m-cache" class="tag-list"></span>
+          </div>
+          <div>
+            <strong>Degraded</strong>
+            <span id="m-degraded" class="tag-list"></span>
+          </div>
+        </section>
+
+        <section class="card suggestions-card" id="suggestions-card">
+          <div class="row-between">
+            <h3>Suggestions</h3>
+            <small id="sugg-count" class="muted"></small>
+          </div>
+          <ol id="suggestions-list" class="suggestions"></ol>
+          <p id="suggestions-empty" class="muted">
+            Submit a city to see recommendations.
+          </p>
+        </section>
+      </section>
+
+      <!-- ======================================================== -->
+      <!--  RIGHT COLUMN: map, dependency health, history, logs    -->
+      <!-- ======================================================== -->
+      <section class="right-col">
+        <div class="card map-card">
+          <div class="map-header">
+            <h3>Trip map</h3>
+            <small id="map-hint" class="muted">
+              Submit a city to plot suggestions on the map.
+            </small>
+          </div>
+          <div id="map" aria-label="Map of suggestions"></div>
+        </div>
+
+        <section class="card health-card">
+          <div class="row-between">
+            <h3>System health</h3>
+            <button id="refresh-health" class="ghost" type="button">
+              Refresh
+            </button>
+          </div>
+          <div id="health-grid" class="health-grid">
+            <div class="muted">Loading dependency status...</div>
+          </div>
+          <div class="health-stats">
+            <div><span class="muted">DB:</span> <span id="hs-db">-</span></div>
+            <div>
+              <span class="muted">History rows:</span>
+              <span id="hs-history">-</span>
+            </div>
+            <div>
+              <span class="muted">Cached cities:</span>
+              <span id="hs-places">-</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card history-card">
+          <div class="row-between">
+            <h3>Recent queries</h3>
+            <button id="refresh-history" class="ghost" type="button">
+              Refresh
+            </button>
+          </div>
+          <ul id="history-list" class="history-list">
+            <li class="muted">No queries yet.</li>
+          </ul>
+        </section>
+
+        <section class="card logs-card">
+          <div class="row-between">
+            <h3>Live logs</h3>
+            <div class="log-controls">
+              <label class="log-toggle">
+                <input id="logs-errors-only" type="checkbox" />
+                <span>Errors only</span>
+              </label>
+              <label class="log-toggle">
+                <input id="logs-autoscroll" type="checkbox" checked />
+                <span>Auto-scroll</span>
+              </label>
+              <button id="logs-pause" class="ghost" type="button">Pause</button>
+            </div>
+          </div>
+          <pre id="logs-stream" class="logs-stream">Waiting for logs...</pre>
+          <small class="muted">
+            In-memory ring buffer of the last 500 records. Mirrors what you see
+            in the uvicorn terminal.
+          </small>
+        </section>
+      </section>
+    </main>
+
+    <!--
+      Leaflet JS - same SRI hash from unpkg as their docs recommend.
+      Loaded with `defer` so it doesn't block our app code below.
+    -->
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+      defer
+    ></script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>How it works - Local Trip Suggester</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/how-it-works.css" />
+
+    <!--
+      Mermaid renders the diagrams below client-side. We pin a stable
+      version and call mermaid.initialize() once the body has loaded.
+    -->
+    <script
+      src="https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js"
+      defer
+    ></script>
+  </head>
+  <body class="docs-body">
+    <header class="app-header">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">[T]</span>
+        <div>
+          <h1>How it works</h1>
+          <p class="tagline">
+            A guided tour of the architecture, request lifecycle, tech
+            stack, and code flow - written for an interview.
+          </p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <a class="docs-link" href="/ui">&larr; Back to dashboard</a>
+        <a class="docs-link" href="/docs" target="_blank" rel="noreferrer"
+          >API docs</a
+        >
+      </div>
+    </header>
+
+    <nav class="docs-toc">
+      <a href="#overview">1. Overview</a>
+      <a href="#architecture">2. Architecture</a>
+      <a href="#sequence">3. Request lifecycle</a>
+      <a href="#stack">4. Tech stack</a>
+      <a href="#code-flow">5. Code flow</a>
+      <a href="#resilience">6. Resilience</a>
+      <a href="#data">7. Data model</a>
+      <a href="#observability">8. Observability</a>
+      <a href="#scaling">9. Scaling notes</a>
+      <a href="#interview">10. Interview cheatsheet</a>
+    </nav>
+
+    <main class="docs-main">
+      <!-- ============================================================ -->
+      <section id="overview" class="card docs-card">
+        <h2>1. Overview</h2>
+        <p>
+          <strong>Local Trip Suggester</strong> is a FastAPI service that
+          recommends tourist places for a city, tailored to the
+          <em>live weather</em>, the user's <em>preference</em> (a
+          free-text intent like "peaceful places with views"), and the
+          user's <em>locality</em> (used for distance + travel-cost
+          estimates).
+        </p>
+        <p>
+          The interesting parts (and the parts to highlight in an
+          interview):
+        </p>
+        <ul>
+          <li>
+            <strong>LLM intent extraction</strong> - free-text prompts
+            like "want to eat something" or "feeling tired" are
+            translated into a structured
+            <code>{category, search_keywords, mood}</code> via a
+            rule-based fast path with a Bedrock fallback for ambiguous
+            phrasings. Without this every prompt would fetch the same
+            generic "tourist attractions" pool from Foursquare.
+          </li>
+          <li>
+            <strong>Async fan-out</strong> - geocoding + intent
+            extraction run in parallel; weather + places run in
+            parallel right after. <code>asyncio.gather</code> all
+            the way down.
+          </li>
+          <li>
+            <strong>Layered fallback &amp; runtime circuit-breaker</strong>
+            - Foursquare &rarr; OpenStreetMap Overpass &rarr; stale
+            cache; weather &rarr; stale cache; Bedrock &rarr;
+            rule-based template. The Foursquare client carries a
+            class-level circuit-breaker: one "no credits" 429 trips it
+            and every subsequent request in the process skips
+            Foursquare entirely (Overpass becomes the primary).
+          </li>
+          <li>
+            <strong>Overpass mirror failover</strong> - 3 mirrors
+            (overpass-api.de, overpass.kumi.systems,
+            overpass.private.coffee) tried in order on transport
+            errors / 5xx / 429. The main Overpass instance is
+            heavily overloaded; failing over silently means the
+            user almost never sees an empty result.
+          </li>
+          <li>
+            <strong>Anchor-first queries</strong> - we always geocode
+            the city (and locality if given) and query Foursquare /
+            Overpass with <code>(lat,lng) + 25 km radius</code>. We
+            then drop anything &gt;30 km from the anchor. This kills
+            the "Pune query gave Lonavala results" class of bug that
+            comes from inconsistent OSM admin boundaries.
+          </li>
+          <li>
+            <strong>Hybrid LLM role</strong> - the rule-based ranker
+            does the broad cut (cheap, deterministic, explainable); the
+            LLM <em>curates</em> the final picks from the top-2x
+            shortlist in <strong>one</strong> Bedrock call and writes a
+            one-line reason for each. Names are validated against the
+            shortlist so the LLM cannot hallucinate a place.
+          </li>
+          <li>
+            <strong>Diversity rule</strong> - the ranker caps how many
+            places of the same primary category go into a single result
+            set, so different intents (peaceful vs adventure vs history)
+            actually surface different places.
+          </li>
+          <li>
+            <strong>Live observability</strong> - JSON structured logs,
+            per-request UUID, a ring-buffer log endpoint, and
+            <code>/health/detailed</code> that probes every dependency in
+            parallel (with three states: ok / disabled / down, so a
+            kill-switched provider shows amber, not red).
+          </li>
+        </ul>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="architecture" class="card docs-card">
+        <h2>2. Architecture</h2>
+        <p>
+          One FastAPI process talks to five external APIs and one
+          relational database. The frontend is a single static file
+          (Leaflet + vanilla JS) served from the same FastAPI app.
+        </p>
+        <pre class="mermaid">
+flowchart LR
+    UI[Single-page dashboard<br/>HTML + Leaflet + vanilla JS]
+    UI -->|POST /suggest-trip| API[FastAPI app]
+    UI -->|GET /health/detailed| API
+    UI -->|GET /history,/logs| API
+
+    API --> IP[Intent parser<br/>rules + Bedrock fallback]
+    API --> GC[GeocodeClient<br/>Nominatim]
+    IP --> O((TripIntent))
+    GC --> AN((anchor lat,lng))
+
+    API --> WC[WeatherClient<br/>OpenWeather]
+    O & AN --> PC[PlacesClient<br/>Foursquare<br/>+ circuit-breaker]
+    PC -. primary if disabled .-> OP[OverpassClient<br/>OSM, 3 mirrors<br/>with failover]
+    PC -. fallback on 429/5xx .-> OP
+    PC --> R[Ranker<br/>weather + preference rules<br/>+ proximity + diversity]
+    OP --> R
+    R -->|top 2x shortlist| CUR[LLMClient.curate_places<br/>Bedrock Nova Lite, ONE call]
+    CUR -. fallback .-> RB[Rule-based top-N]
+    CUR --> EN[Enricher<br/>haversine distance + budget]
+    RB --> EN
+    EN --> RESP[TripResponse + meta.intent]
+
+    API <-->|cache + audit| DB[(Postgres / SQLite<br/>place_cache, weather_log,<br/>query_history)]
+        </pre>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="sequence" class="card docs-card">
+        <h2>3. Request lifecycle</h2>
+        <p>
+          Walk this top to bottom in an interview - it covers every
+          design decision.
+        </p>
+        <pre class="mermaid">
+sequenceDiagram
+    actor User
+    participant UI as Dashboard
+    participant API as FastAPI
+    participant IP as Intent parser
+    participant N as Nominatim
+    participant W as OpenWeather
+    participant F as Foursquare
+    participant O as Overpass (3 mirrors)
+    participant R as Ranker
+    participant L as Bedrock
+    participant DB as Postgres
+
+    User->>UI: fills form, clicks Suggest places
+    UI->>API: POST /suggest-trip (city, preference, locality)
+
+    Note over API: Stage 1 - resolve (parallel)
+    par geocode + intent extraction
+        API->>IP: extract_intent(prompt)
+        IP-->>API: category, keywords, mood, source
+    and
+        API->>N: geocode(city) and geocode(locality)
+        N-->>API: lat, lng anchors
+    end
+    Note over API: anchor = locality or city; query = intent keywords
+
+    Note over API: Stage 2 - fan-out (parallel)
+    par weather + places
+        API->>W: GET /weather (TTL cache first)
+    and
+        API->>F: GET /places/search (ll, radius=25km, query)
+    end
+
+    alt Foursquare 200
+        F-->>API: places list
+    else Foursquare 429 no credits OR disabled
+        API->>API: trip circuit breaker
+        API->>O: POST /api/interpreter (mirror 1, 2, or 3)
+        O-->>API: OSM nodes/ways
+        Note over API: meta.degraded += places_primary, places_fallback_overpass
+    end
+
+    Note over API: Stage 4 - drop candidates over 30km from anchor
+
+    API->>R: Stage 5a - rank top-2x shortlist
+    R-->>API: ordered shortlist + scores
+
+    API->>L: Stage 5b - curate_places (ONE call)
+    L-->>API: top max_results + reasons
+    Note over API: validate names; drop hallucinations
+
+    Note over API: Stage 6 - haversine + budget
+
+    API->>DB: Stage 7 - INSERT INTO query_history
+    API-->>UI: TripResponse + meta.intent
+    UI->>UI: render weather, list, Leaflet map
+        </pre>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="stack" class="card docs-card">
+        <h2>4. Tech stack &amp; why</h2>
+        <table class="docs-table">
+          <thead>
+            <tr><th>Layer</th><th>Choice</th><th>Why</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Web framework</td>
+              <td><strong>FastAPI</strong></td>
+              <td>Async-first, Pydantic v2 validation, free Swagger UI at <code>/docs</code></td>
+            </tr>
+            <tr>
+              <td>Async HTTP</td>
+              <td><strong>httpx.AsyncClient</strong></td>
+              <td>One pooled client process-wide; matches FastAPI's loop</td>
+            </tr>
+            <tr>
+              <td>Retries</td>
+              <td><strong>tenacity</strong> (exp backoff)</td>
+              <td>Decorator-style retries; we explicitly skip 429s (a quota error doesn't recover in 800 ms)</td>
+            </tr>
+            <tr>
+              <td>Places primary</td>
+              <td><strong>Foursquare new Places API</strong></td>
+              <td>Curated POIs, structured categories + ratings</td>
+            </tr>
+            <tr>
+              <td>Places fallback</td>
+              <td><strong>OpenStreetMap Overpass</strong></td>
+              <td>Free, no API key, robust against Foursquare quota exhaustion</td>
+            </tr>
+            <tr>
+              <td>Reasoning</td>
+              <td><strong>AWS Bedrock Nova Lite</strong> via Converse API</td>
+              <td>Cheap, fast, drop-in for Claude/Titan via the same Converse interface</td>
+            </tr>
+            <tr>
+              <td>Database</td>
+              <td><strong>Neon PostgreSQL</strong> (SQLite locally)</td>
+              <td>Serverless, free tier, JSONB for cache + audit</td>
+            </tr>
+            <tr>
+              <td>ORM</td>
+              <td><strong>SQLAlchemy 2 + psycopg v3</strong></td>
+              <td>Mature, declarative typed mapping, Python 3.13/14 wheels</td>
+            </tr>
+            <tr>
+              <td>Geocoding</td>
+              <td><strong>Nominatim (OSM)</strong></td>
+              <td>Free, no API key, just a descriptive User-Agent</td>
+            </tr>
+            <tr>
+              <td>Frontend</td>
+              <td><strong>Vanilla JS + Leaflet</strong></td>
+              <td>No build step, instant to read, OSM tiles match our backend</td>
+            </tr>
+            <tr>
+              <td>Tests</td>
+              <td><strong>pytest + respx</strong></td>
+              <td>Hermetic - every external HTTP is mocked at the wire level</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="code-flow" class="card docs-card">
+        <h2>5. Code flow (function-level)</h2>
+        <p>
+          A request to <code>POST /suggest-trip</code> flows through
+          these functions in this order. File paths are clickable in the
+          repo:
+        </p>
+        <ol class="codeflow">
+          <li>
+            <code>app/main.py: create_app()</code>
+            <span class="muted">- mounts routes + static UI; lifespan logs startup</span>
+          </li>
+          <li>
+            <code>app/utils/logger.py: RequestIdMiddleware</code>
+            <span class="muted">- stamps every request with a 12-char UUID, sets <code>contextvar</code>, returns it as <code>x-request-id</code></span>
+          </li>
+          <li>
+            <code>app/api/routes_trip.py: suggest_trip_endpoint()</code>
+            <span class="muted">- Pydantic validates the body, then delegates to the service</span>
+          </li>
+          <li>
+            <code>app/services/trip_service.py: suggest_trip()</code> <strong>(the orchestrator)</strong>
+            <ol>
+              <li>
+                Stage 1: <strong>resolve</strong>. Geocodes city + (optionally) locality AND extracts intent via <code>intent_parser.extract_intent()</code> - all three in parallel. Anchor = locality &gt; city &gt; none. Intent is a <code>TripIntent</code> dataclass with <code>category</code>, <code>search_keywords</code>, <code>mood</code>, <code>source</code> ("rule" / "llm" / "default").
+              </li>
+              <li>
+                Stage 2: <strong>fan-out</strong>. Provider selection lives here. If <code>PlacesClient.is_disabled()</code> (config kill-switch OR runtime breaker open), Overpass becomes the primary - no wasted call to a known-dead provider. Otherwise launches <code>WeatherClient.get</code> and <code>PlacesClient.search_tourist_places(lat, lng, radius=25km, query=intent.query_string, cache_namespace=intent.category)</code> in parallel.
+              </li>
+              <li>
+                Stage 3: <strong>fallback chain</strong>. If FSQ raises <code>UpstreamError</code> with a "no credits" 429, the breaker trips (<code>PlacesClient._billing_disabled = True</code>) and we call <code>OverpassClient.search_tourist_places(lat, lng, radius=25km)</code> which itself fails over across 3 mirrors.
+              </li>
+              <li>
+                Stage 4: <strong>distance filter</strong> - drops anything &gt;30km from the anchor. Hard safety net for inconsistent OSM admin boundaries.
+              </li>
+              <li>
+                Stage 5: <code>ranker.rank_places()</code> scores each candidate (<code>0.20*weather + 0.45*intent + 0.15*pop + 0.20*proximity</code>) with a per-category diversity cap, then we hand the top 2x to <code>llm.curate_places</code> - <strong>one</strong> Bedrock call returns the final ordered picks plus a one-line reason each. Names are validated; if the LLM hallucinates we drop those picks and top up from the rule-based shortlist.
+              </li>
+              <li>
+                Stage 6: <code>distance.haversine_km</code> + <code>budget.estimate_budget</code> annotate every pick. Only places that didn't get a curate-time reason go through <code>llm.generate_place_reasoning</code>.
+              </li>
+              <li>
+                Stage 7: writes a row to <code>query_history</code> and returns the <code>TripResponse</code> (with <code>meta.intent</code>, <code>meta.llm_curate_used</code>, and <code>meta.degraded</code> so the UI can show whether AI shaped the picks and exactly what degraded).
+              </li>
+            </ol>
+          </li>
+          <li>
+            <code>app/services/intent_parser.py</code>
+            <span class="muted">- two-tier intent extractor: rule-based fast path (<code>parse_intent_rule_based</code>) for obvious prompts, LLM escalation (<code>BedrockLLMProvider.extract_intent</code>) for ambiguous ones.</span>
+          </li>
+          <li>
+            <code>app/clients/places_client.py</code>
+            <span class="muted">- runtime circuit breaker (<code>_billing_disabled</code> class flag, <code>is_disabled()</code> classmethod, <code>trip_billing_breaker()</code> trigger).</span>
+          </li>
+          <li>
+            <code>app/clients/overpass_client.py</code>
+            <span class="muted">- mirror failover (<code>OVERPASS_MIRRORS</code> list, <code>_fetch_overpass</code> tries each in order; <code>ping_overpass</code> for the dashboard's health probe).</span>
+          </li>
+          <li>
+            <code>app/clients/http_base.py: request_json()</code>
+            <span class="muted">- shared retries + typed errors. <code>RateLimitError</code> is NOT in the retry tuple - we don't burn quota.</span>
+          </li>
+          <li>
+            <code>app/db/cache.py</code>
+            <span class="muted">- <code>get_fresh_*</code> for TTL-respecting hits, <code>get_stale_*</code> for last-resort fallback.</span>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="resilience" class="card docs-card">
+        <h2>6. Resilience matrix</h2>
+        <p>
+          Anything outside this process can fail; we never let one
+          upstream take the whole response down.
+        </p>
+        <table class="docs-table">
+          <thead>
+            <tr><th>Failure</th><th>What we do</th><th>Visible to caller as</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Foursquare 429 "no credits"</td>
+              <td><strong>Trip the runtime circuit breaker</strong> - subsequent requests skip FSQ entirely - then switch to Overpass for this request</td>
+              <td><code>meta.degraded = ["places_primary", "places_fallback_overpass"]</code>; subsequent requests carry <code>"places_primary_skipped"</code></td>
+            </tr>
+            <tr>
+              <td>Foursquare 5xx / network</td>
+              <td>Switch to OpenStreetMap Overpass</td>
+              <td><code>meta.degraded = ["places_primary", "places_fallback_overpass"]</code></td>
+            </tr>
+            <tr>
+              <td><code>FOURSQUARE_ENABLED=false</code> in <code>.env</code></td>
+              <td>Skip FSQ entirely; Overpass is the primary</td>
+              <td><code>meta.degraded += "places_primary_skipped"</code></td>
+            </tr>
+            <tr>
+              <td>Overpass mirror #1 down</td>
+              <td>Try mirror #2 (kumi.systems), then #3 (private.coffee)</td>
+              <td>(transparent - logged at WARNING but no caller-visible tag)</td>
+            </tr>
+            <tr>
+              <td>OpenWeather 5xx</td>
+              <td>Serve last cached payload (any age)</td>
+              <td><code>meta.cache_hits += "weather"</code></td>
+            </tr>
+            <tr>
+              <td>Both places providers down</td>
+              <td>Empty <code>suggestions[]</code>, weather + UI still render</td>
+              <td><code>meta.degraded = ["places_primary", "places", "no_places"]</code></td>
+            </tr>
+            <tr>
+              <td>Nominatim fails (city)</td>
+              <td>Fall back to name-based queries (less precise)</td>
+              <td><code>meta.degraded += "geocode_city"</code></td>
+            </tr>
+            <tr>
+              <td>Nominatim fails (locality)</td>
+              <td>Use city anchor; no per-place distance / travel cost</td>
+              <td><code>meta.degraded += "geocode_locality"</code></td>
+            </tr>
+            <tr>
+              <td>LLM curate fails / hallucinates names</td>
+              <td>Use rule-based top-N + per-place reasoning</td>
+              <td><code>meta.degraded += "llm_curate"</code>, <code>llm_curate_used=false</code></td>
+            </tr>
+            <tr>
+              <td>Bedrock per-place reasoning fails</td>
+              <td>Use deterministic rule-based one-liner</td>
+              <td><code>meta.degraded += "llm"</code></td>
+            </tr>
+            <tr>
+              <td>DB write fails</td>
+              <td>Log + rollback, never block the user response</td>
+              <td>(no tag - we just log)</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="data" class="card docs-card">
+        <h2>7. Data model</h2>
+        <p>Three tables, all using SQLAlchemy 2 declarative mapping.</p>
+        <pre class="mermaid">
+erDiagram
+    QUERY_HISTORY {
+      int id PK
+      string city
+      text preference
+      string locality
+      json response
+      int latency_ms
+      datetime created_at
+    }
+    PLACE_CACHE {
+      int id PK
+      string city UK "fsqv2:lat,lng:radius:ns | osmv2:lat,lng:radius"
+      json payload
+      datetime fetched_at
+      datetime expires_at "24h TTL"
+    }
+    WEATHER_LOG {
+      int id PK
+      string city
+      json payload
+      datetime fetched_at
+      datetime expires_at "30min TTL"
+    }
+        </pre>
+        <p>
+          <strong>Why one cache table, multiple namespaces?</strong>
+          Cache keys carry <em>provider + anchor + intent</em>:
+        </p>
+        <ul>
+          <li><code>fsqv2:17.44,78.38:25000:food</code> - Foursquare,
+            anchor (lat, lng) rounded to 0.01°, radius, intent
+            category. Different intents (food vs history) on the
+            same anchor cache separately.</li>
+          <li><code>osmv2:17.44,78.38:25000</code> - Overpass,
+            anchor + radius. Overpass pulls a wide tag set so we
+            don't need to namespace by intent.</li>
+          <li><code>fsq-name:&lt;city&gt;:&lt;ns&gt;</code> /
+            <code>osm-name:&lt;city&gt;</code> - name-based fallbacks
+            used when geocoding fails.</li>
+        </ul>
+        <p>
+          A stale Foursquare cache will never accidentally satisfy
+          an Overpass request, and a "food" cache will never serve a
+          "history" request, even on the same anchor.
+        </p>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="observability" class="card docs-card">
+        <h2>8. Observability</h2>
+        <ul>
+          <li>
+            <strong>Structured JSON logs</strong> (one object per line)
+            with <code>ts / level / logger / msg / rid</code>. Easy to
+            grep, easy to ship to CloudWatch.
+          </li>
+          <li>
+            <strong>Per-request UUID</strong> (<code>rid</code>) injected
+            via a <code>contextvars</code>-based middleware. The same id
+            is sent back as the <code>x-request-id</code> response
+            header so you can line up the browser DevTools network
+            panel with server logs.
+          </li>
+          <li>
+            <strong>Pipeline-stage logs</strong> -
+            <code>trip_service</code> emits <code>[1/7]</code>...
+            <code>[7/7]</code> prefixed lines so you can trace one
+            request through the orchestrator visually.
+          </li>
+          <li>
+            <strong>Two health endpoints</strong> -
+            <code>GET /health</code> (cheap, no I/O) and
+            <code>GET /health/detailed</code> (probes every dependency
+            in parallel). Kubernetes liveness vs readiness pattern.
+          </li>
+          <li>
+            <strong>In-memory log buffer</strong> -
+            <code>GET /logs?limit=200</code> returns the last 500 lines.
+            The dashboard renders these live - useful in interview demos
+            because failures show up in the panel without leaving the UI.
+          </li>
+        </ul>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="scaling" class="card docs-card">
+        <h2>9. How would you scale this?</h2>
+        <ul>
+          <li>
+            <strong>Move cache to Redis</strong> - lower latency than
+            JSONB hits, native TTL, easier per-key invalidation.
+          </li>
+          <li>
+            <strong>Bedrock behind a queue</strong> - if reasoning grows
+            longer (e.g. multi-place day plans), push to SQS, return
+            immediately, stream partials to the UI via SSE.
+          </li>
+          <li>
+            <strong>Per-IP rate limiting</strong> - a Redis token bucket
+            in front of <code>/suggest-trip</code> protects upstream
+            quotas (esp. Foursquare).
+          </li>
+          <li>
+            <strong>Pre-warm popular cities</strong> - a scheduled job
+            calls the pipeline for top-50 cities every night so 100% of
+            user traffic is cache hits.
+          </li>
+          <li>
+            <strong>Auth</strong> - add a FastAPI dependency that
+            validates a JWT or API key on <code>/suggest-trip</code>;
+            keep <code>/health</code> open for load balancers.
+          </li>
+        </ul>
+      </section>
+
+      <!-- ============================================================ -->
+      <section id="interview" class="card docs-card">
+        <h2>10. Interview cheatsheet</h2>
+        <p>
+          When asked "tell me about this project" - this is the
+          two-minute version:
+        </p>
+        <blockquote>
+          "It's a FastAPI service that recommends tourist places for a
+          city, tailored to <em>live weather</em>, the user's
+          <em>free-text preference</em>, and the user's
+          <em>locality</em>. The first thing the orchestrator does is
+          translate the prompt - which can be ambiguous like
+          <em>"want to eat something"</em> or <em>"feeling tired"</em>
+          - into a structured intent via a rule-based fast path with a
+          Bedrock fallback for ambiguous phrasings. That intent drives
+          the Foursquare query and the cache namespace, so different
+          prompts genuinely fetch different candidate pools.
+          <br /><br />
+          In parallel with intent extraction we geocode the city and
+          locality via Nominatim - I treat that as the anchor for
+          everything downstream so we never query providers by a
+          fragile city name. We then fan out to OpenWeather and
+          Foursquare (anchored on <code>ll=lat,lng + 25 km radius</code>)
+          in parallel. Foursquare's free credits run out, so the
+          client carries a class-level circuit-breaker: one
+          <em>"no credits"</em> 429 trips it and every subsequent
+          request in the process skips Foursquare and goes straight to
+          OpenStreetMap Overpass. There's also a hard
+          <code>FOURSQUARE_ENABLED=false</code> kill-switch in the
+          config for the same purpose. Overpass itself fails over
+          across three public mirrors, since the main host is
+          regularly overloaded.
+          <br /><br />
+          The result pool goes through a hard 30 km filter (so we
+          never surface Lonavala for a Pune query), then a rule-based
+          scorer that combines weather-fit, preference match,
+          popularity, and proximity, plus a diversity cap so we don't
+          hand back five museums in a row. We hand the top 2x to AWS
+          Bedrock (Nova Lite via the Converse API) for the final
+          curate step - <strong>one</strong> LLM call picks the best
+          matches and writes a one-sentence reason for each. We
+          validate the names against the shortlist so the LLM cannot
+          hallucinate. If the LLM is down we fall through to
+          rule-based ordering with a deterministic fallback sentence.
+          Every degraded path is tagged in <code>meta.degraded</code>,
+          <code>meta.intent</code> shows how the prompt was parsed,
+          and <code>meta.llm_curate_used</code> tells the caller
+          whether AI shaped the picks.
+          <br /><br />
+          There's a single-page UI on top - vanilla JS + Leaflet -
+          that draws the suggestions on a map with distance lines from
+          the user's locality, plus a system-health panel that probes
+          every dependency in parallel (with three states: ok /
+          disabled / down) and a live in-memory log feed."
+        </blockquote>
+        <h3>Likely follow-ups</h3>
+        <ul>
+          <li>
+            <strong>"Why intent extraction? Couldn't the LLM just rank everything?"</strong>
+            Three reasons. (1) Cost / latency - letting the LLM rank means feeding it 80 candidates. Two-step (rules &rarr; LLM curate from a 10-item shortlist) is one paid call per request. (2) Determinism - rules cover obvious prompts (food, history) without random LLM variance. (3) Candidate quality - <em>without intent extraction, the LLM is only re-ordering the same generic candidate pool.</em> The original bug was at the fetch layer, not the rank layer. Once Foursquare's query is intent-driven, the candidates themselves match the prompt.
+          </li>
+          <li>
+            <strong>"How do you handle 429?"</strong> No retry on 429
+            (quota errors don't recover in 800 ms). The PlacesClient
+            inspects the body - if it contains "no credits" we
+            <strong>trip the circuit breaker</strong> for the rest of
+            the process and skip Foursquare entirely. Otherwise we
+            switch to the Overpass fallback for this one request.
+          </li>
+          <li>
+            <strong>"Why two health endpoints?"</strong> Liveness vs
+            readiness - the Kubernetes-standard split. Liveness has no
+            I/O so a load balancer can poll every second; readiness
+            probes every upstream in parallel and is more expensive.
+          </li>
+          <li>
+            <strong>"How does the LLM curate avoid hallucinating?"</strong>
+            The prompt asks for strict JSON
+            <code>{"picks":[{"name":"...","reason":"..."}]}</code>.
+            Every returned name is validated against the input
+            shortlist - hallucinations are dropped, then we top up
+            from the rule-based shortlist if we end up short.
+          </li>
+          <li>
+            <strong>"How does caching work?"</strong> Two tables,
+            keyed by provider + anchor + intent (e.g.
+            <code>fsqv2:17.44,78.38:25000:food</code>). Always check
+            fresh first; on upstream failure try stale as a last
+            resort.
+          </li>
+          <li>
+            <strong>"Why three Overpass mirrors?"</strong> The main
+            <code>overpass-api.de</code> instance is heavily
+            overloaded during peak hours - a single user query can
+            hang for 30s. We try each mirror in turn on transport
+            errors / 5xx / 429. Failover is logged at WARNING but
+            invisible to the caller.
+          </li>
+          <li>
+            <strong>"Why diversity in the ranker?"</strong> With 80
+            OSM candidates, the top-K by raw score tends to cluster
+            on the same category (e.g. all monuments). Capping
+            per-category count guarantees the user sees variety -
+            which the interviewer will notice immediately when
+            toggling the preference.
+          </li>
+          <li>
+            <strong>"What does <code>meta.intent.source</code> tell me?"</strong>
+            "rule" means the keyword fast path matched; "llm" means
+            the rules didn't trigger and Bedrock did the semantic
+            translation; "default" means the prompt was empty. Surfaced
+            in the dashboard's "Understood as" chip so the demo viewer
+            can see which path actually ran.
+          </li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="docs-footer">
+      <a href="/ui">&larr; Back to dashboard</a>
+    </footer>
+
+    <script>
+      // Initialise Mermaid in dark mode to match the page theme.
+      window.addEventListener("load", () => {
+        if (window.mermaid) {
+          window.mermaid.initialize({
+            startOnLoad: true,
+            theme: "dark",
+            themeVariables: {
+              primaryColor: "#3b82f6",
+              primaryTextColor: "#e5e9f4",
+              primaryBorderColor: "#233252",
+              lineColor: "#60a5fa",
+              tertiaryColor: "#182238",
+            },
+            sequence: { mirrorActors: false, useMaxWidth: true },
+            flowchart: { useMaxWidth: true },
+          });
+        }
+      });
+    </script>
+  </body>
+</html>
